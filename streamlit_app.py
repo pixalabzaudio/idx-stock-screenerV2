@@ -34,10 +34,10 @@ def get_rsi(ticker):
     Returns: (rsi_value, signal) or None if data unavailable
     """
     try:
-        # Get historical data for 30 days (to calculate RSI25)
+        # Get historical data for RSI_PERIOD + 10 days (to ensure enough data)
         end_date = datetime.now()
         stock = yf.Ticker(ticker)
-        hist = stock.history(period="30d")
+        hist = stock.history(period=f"{RSI_PERIOD + 10}d")
         
         if len(hist) < RSI_PERIOD + 1:
             return None
@@ -68,7 +68,8 @@ def get_rsi(ticker):
         else:
             signal = "Neutral"
         
-        return (latest_rsi, signal, rsi.tail(14).values)  # Return last 14 days of RSI values for chart
+        # Return all available RSI values for chart (up to RSI_PERIOD days)
+        return (latest_rsi, signal, rsi.tail(RSI_PERIOD).values)
     
     except Exception as e:
         # Log error for debugging
@@ -203,13 +204,14 @@ def apply_fundamental_filters(technical_results, min_ni, max_pe, max_pb, min_gro
     
     return final_results
 
-def create_rsi_chart(rsi_values, current_rsi):
+@st.cache_data(ttl=300)
+def create_rsi_chart_image(rsi_values, current_rsi):
     """
-    Create a matplotlib chart for RSI values
-    Returns: base64 encoded image
+    Create a matplotlib chart for RSI values and return as image
+    Returns: image bytes
     """
     # Create figure and axis
-    fig, ax = plt.subplots(figsize=(3, 1.2))
+    fig, ax = plt.subplots(figsize=(3, 1.5))
     
     # Plot RSI line
     x = range(len(rsi_values))
@@ -226,8 +228,13 @@ def create_rsi_chart(rsi_values, current_rsi):
     # Set y-axis limits
     ax.set_ylim(0, 100)
     
-    # Remove x-axis ticks
-    ax.set_xticks([])
+    # Add x-axis ticks for every 5 days
+    tick_positions = [i for i in range(0, len(rsi_values), 5)]
+    if len(rsi_values) - 1 not in tick_positions:
+        tick_positions.append(len(rsi_values) - 1)  # Add the last day
+    
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels([f"D-{len(rsi_values)-i}" for i in tick_positions], fontsize=7, rotation=45)
     
     # Set y-axis ticks
     ax.set_yticks([0, OVERSOLD_THRESHOLD, OVERBOUGHT_THRESHOLD, 100])
@@ -240,6 +247,9 @@ def create_rsi_chart(rsi_values, current_rsi):
     
     # Highlight the current RSI with a dot
     ax.scatter(len(rsi_values)-1, current_rsi, color='blue', s=30, zorder=5)
+    
+    # Add title showing RSI period
+    ax.set_title(f"RSI({RSI_PERIOD}) Chart", fontsize=10)
     
     # Remove spines
     for spine in ax.spines.values():
@@ -254,13 +264,7 @@ def create_rsi_chart(rsi_values, current_rsi):
     plt.close(fig)
     buf.seek(0)
     
-    # Encode PNG image to base64 string
-    img_str = base64.b64encode(buf.read()).decode()
-    
-    # Create HTML img tag
-    html = f'<img src="data:image/png;base64,{img_str}" style="width:100%;">'
-    
-    return html
+    return buf
 
 def process_batch_technical_first(batch_tickers, rsi_min, rsi_max, show_oversold, show_overbought, show_neutral):
     """
@@ -313,6 +317,16 @@ def main():
     }
     .stButton > button {
         width: 100%;
+    }
+    .rsi-chart-container {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        margin: 5px 0;
+    }
+    .rsi-chart-container img {
+        max-width: 100%;
+        height: auto;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -491,11 +505,11 @@ def main():
     
     with main_tab2:
         st.subheader("About IDX Stock Screener")
-        st.write("""
+        st.write(f"""
         This application screens all stocks listed on the Indonesia Stock Exchange (IDX) using a two-pass approach:
         
         **First Pass - Technical Screening:**
-        - RSI(25) with signals for oversold (RSI<30) and overbought (RSI>70) conditions
+        - RSI({RSI_PERIOD}) with signals for oversold (RSI<{OVERSOLD_THRESHOLD}) and overbought (RSI>{OVERBOUGHT_THRESHOLD}) conditions
         - Custom RSI range filtering
         
         **Second Pass - Fundamental Screening:**
@@ -593,20 +607,33 @@ def main():
             tech_df = pd.DataFrame([(t[0], t[1], t[2]) for t in technical_results], 
                                   columns=["Ticker", "RSI", "Signal"])
             
-            # Create RSI charts for each ticker
-            rsi_charts = []
-            for result in technical_results:
-                ticker, rsi, signal, rsi_history = result
-                rsi_charts.append(create_rsi_chart(rsi_history, rsi))
-            
-            # Add RSI charts to dataframe
-            tech_df['RSI Chart'] = rsi_charts
-            
             # Display the dataframe
             with technical_results_placeholder.container():
                 st.subheader("Technical Screening Results")
                 st.write(f"Found {len(technical_results)} stocks matching technical criteria")
+                
+                # Display the dataframe
                 st.dataframe(tech_df, height=200, use_container_width=True)
+                
+                # Display RSI charts separately
+                st.subheader(f"RSI({RSI_PERIOD}) Charts for Technical Results")
+                
+                # Create columns for displaying charts
+                cols = st.columns(4)  # Display 4 charts per row
+                
+                # Display RSI charts
+                for i, result in enumerate(technical_results):
+                    ticker, rsi, signal, rsi_history = result
+                    col_idx = i % 4
+                    
+                    with cols[col_idx]:
+                        # Create chart image
+                        chart_img = create_rsi_chart_image(rsi_history, rsi)
+                        
+                        # Display ticker and chart
+                        st.write(f"**{ticker}** (RSI: {rsi:.1f})")
+                        st.image(chart_img, caption=f"{signal}", use_column_width=True)
+                
                 st.write("Applying fundamental filters...")
         
         # SECOND PASS: Fundamental Screening
@@ -646,22 +673,11 @@ def main():
             display_df['P/E'] = display_df['P/E'].map('{:.2f}'.format)
             display_df['P/B'] = display_df['P/B'].map('{:.2f}'.format)
             
-            # Create RSI charts for each ticker in final results
-            rsi_charts = []
-            for result in final_results:
-                ticker, ni, growth, pe, pb, rsi, signal, rsi_history = result
-                rsi_charts.append(create_rsi_chart(rsi_history, rsi))
-            
-            # Add RSI charts to display dataframe
-            display_df['RSI Chart'] = rsi_charts
-            
-            # Reorder columns for display
-            display_df = display_df[["Ticker", "NI(T)", "Growth(%)", "P/E", "P/B", "RSI Chart", "Signal"]]
-            
             # Cache the results
             st.session_state.results_cache = {
                 'df': df,
                 'display_df': display_df,
+                'final_results': final_results,  # Store full results including RSI history
                 'technical_count': len(technical_results),
                 'final_count': len(final_results),
                 'elapsed_time': time.time() - start_time,
@@ -673,6 +689,7 @@ def main():
             st.session_state.results_cache = {
                 'df': None,
                 'display_df': None,
+                'final_results': [],
                 'technical_count': len(technical_results),
                 'final_count': 0,
                 'elapsed_time': time.time() - start_time,
@@ -705,11 +722,28 @@ def main():
             # Display results table
             with results_placeholder.container():
                 st.subheader("Final Results (Technical + Fundamental)")
-                st.dataframe(
-                    results['display_df'], 
-                    height=500, 
-                    use_container_width=True
-                )
+                
+                # Display the dataframe
+                st.dataframe(results['display_df'], height=300, use_container_width=True)
+                
+                # Display RSI charts separately
+                st.subheader(f"RSI({RSI_PERIOD}) Charts for Final Results")
+                
+                # Create columns for displaying charts
+                cols = st.columns(4)  # Display 4 charts per row
+                
+                # Display RSI charts for final results
+                for i, result in enumerate(results.get('final_results', [])):
+                    ticker, ni, growth, pe, pb, rsi, signal, rsi_history = result
+                    col_idx = i % 4
+                    
+                    with cols[col_idx]:
+                        # Create chart image
+                        chart_img = create_rsi_chart_image(rsi_history, rsi)
+                        
+                        # Display ticker and chart
+                        st.write(f"**{ticker}** (RSI: {rsi:.1f})")
+                        st.image(chart_img, caption=f"{signal} | P/E: {pe:.1f} | P/B: {pb:.1f}", use_column_width=True)
                 
                 # Add download button for CSV export
                 if results['df'] is not None:
@@ -746,13 +780,13 @@ def main():
             st.experimental_rerun()
     
     # Footer
-    st.markdown("""
+    st.markdown(f"""
     <div style="text-align: center; margin-top: 30px; padding: 10px; border-top: 1px solid #ddd;">
         <p style="color: #666; font-size: 0.8em;">
-            IDX Stock Screener | Data from Yahoo Finance | Updated: {update_time}
+            IDX Stock Screener | RSI({RSI_PERIOD}) Analysis | Data from Yahoo Finance | Updated: {st.session_state.last_refresh.strftime('%Y-%m-%d %H:%M:%S') if st.session_state.last_refresh else "Never"}
         </p>
     </div>
-    """.format(update_time=st.session_state.last_refresh.strftime('%Y-%m-%d %H:%M:%S') if st.session_state.last_refresh else "Never"), 
+    """, 
     unsafe_allow_html=True)
 
 if __name__ == "__main__":
